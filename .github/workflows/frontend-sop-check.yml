@@ -1,0 +1,283 @@
+name: Frontend SOP Check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-sop-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend_quality_check:
+    name: Frontend Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check package.json
+        shell: bash
+        run: |
+          echo "=== FRONTEND QUALITY CHECK ==="
+          test -f package.json || {
+            echo "ERROR: package.json tidak ditemukan"
+            exit 1
+          }
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Typecheck
+        run: npm run typecheck --if-present
+
+  react_sop_check:
+    name: Next.js SOP Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run Next.js SOP check
+        shell: bash
+        run: |
+          echo "=== NEXT.JS SOP CHECK - FRONTEND SERVICE ==="
+          echo "Checking Page, Component, Hook, Service, Store, and Validation SOP..."
+
+          ERROR_FILE="sop_errors.log"
+          WARNING_FILE="sop_warnings.log"
+
+          rm -f "$ERROR_FILE" "$WARNING_FILE"
+          touch "$ERROR_FILE" "$WARNING_FILE"
+
+          # Pola pengecekan
+          AXIOS_RE="import .*axios|from ['\"]axios['\"]"
+          FETCH_RE="(^|[^A-Za-z0-9_])fetch\("                    # tidak menangkap refetch(
+          HOOKS_RE="use(State|Effect|Reducer)(<|\()"             # termasuk useState<T>(
+          ZUSTAND_IMPORT_RE="from ['\"]zustand(/[a-z]+)?['\"]"
+          ZUSTAND_CREATE_RE="(^|[^.A-Za-z0-9_])create(<|\()"      # create( / create<T>(), bukan axios.create(
+
+          # File dianggap membuat Zustand store jika import dari zustand DAN memanggil create
+          zustand_create() {
+            grep -qE "$ZUSTAND_IMPORT_RE" "$1" && grep -nE "$ZUSTAND_CREATE_RE" "$1"
+          }
+
+          echo "=== SOP CHECK STARTED ==="
+
+          echo ""
+          echo "1. Checking required frontend structure..."
+
+          if [ ! -d src ]; then
+            echo "ERROR: src directory tidak ditemukan." | tee -a "$ERROR_FILE"
+          fi
+
+          if [ ! -d src/features ]; then
+            echo "ERROR: src/features tidak ditemukan. Feature-based structure wajib digunakan." | tee -a "$ERROR_FILE"
+          fi
+
+          if [ ! -d src/components ] && [ ! -d src/shared/components ]; then
+            echo "WARNING: folder components/shared components tidak ditemukan." | tee -a "$WARNING_FILE"
+          fi
+
+          PAGE_FILES=()
+          COMPONENT_FILES=()
+          SERVICE_FILES=()
+          HOOK_FILES=()
+
+          if [ -d src ]; then
+            # Page: Pages Router (pages/**, kecuali pages/api) + App Router (app/**/page.*)
+            mapfile -d '' PAGE_FILES < <(find src -type f \
+              \( \
+                \( -path "*/pages/*" ! -path "*/pages/api/*" \( -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" -o -name "*.js" \) \) \
+                -o \
+                \( -path "*/app/*" \( -name "page.tsx" -o -name "page.ts" -o -name "page.jsx" -o -name "page.js" \) \) \
+              \) -print0)
+
+            mapfile -d '' COMPONENT_FILES < <(find src -type f \
+              \( -path "*/components/*" -o -path "*/_components/*" \) \
+              \( -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" -o -name "*.js" \) -print0)
+
+            mapfile -d '' SERVICE_FILES < <(find src -type f \
+              \( -path "*/services/*.ts" -o -path "*/service/*.ts" -o -name "*.service.ts" \) -print0)
+
+            mapfile -d '' HOOK_FILES < <(find src -type f \
+              \( -path "*/hooks/*.ts" -o -path "*/hooks/*.tsx" -o -name "use*.ts" -o -name "use*.tsx" \) -print0)
+          fi
+
+          echo ""
+          echo "2. Checking Page SOP..."
+
+          for FILE in "${PAGE_FILES[@]}"; do
+            echo "Checking page: $FILE"
+
+            if grep -nE "$AXIOS_RE" "$FILE"; then
+              echo "ERROR: $FILE import axios langsung. API logic wajib lewat service." | tee -a "$ERROR_FILE"
+            fi
+
+            if grep -nE "$FETCH_RE" "$FILE"; then
+              echo "ERROR: $FILE menggunakan fetch langsung. API logic wajib lewat service." | tee -a "$ERROR_FILE"
+            fi
+
+            if grep -nE "$HOOKS_RE" "$FILE"; then
+              echo "ERROR: $FILE menggunakan useState/useEffect/useReducer langsung. Logic UI wajib dipindah ke custom hook." | tee -a "$ERROR_FILE"
+            fi
+
+            if zustand_create "$FILE"; then
+              echo "ERROR: $FILE membuat Zustand store di Page. Zustand create hanya boleh di folder stores." | tee -a "$ERROR_FILE"
+            fi
+
+            if grep -nE "if \(.*\.length|if \(.*===|if \(.*!==|alert\(|confirm\(" "$FILE"; then
+              echo "WARNING: $FILE kemungkinan memiliki logic/validasi manual. Pastikan logic dipindah ke hook/schema." | tee -a "$WARNING_FILE"
+            fi
+          done
+
+          echo ""
+          echo "3. Checking Component SOP..."
+
+          for FILE in "${COMPONENT_FILES[@]}"; do
+            echo "Checking component: $FILE"
+
+            if grep -nE "$AXIOS_RE" "$FILE"; then
+              echo "ERROR: $FILE import axios langsung. Component tidak boleh akses API langsung." | tee -a "$ERROR_FILE"
+            fi
+
+            if grep -nE "$FETCH_RE" "$FILE"; then
+              echo "ERROR: $FILE menggunakan fetch langsung. Component tidak boleh akses API langsung." | tee -a "$ERROR_FILE"
+            fi
+
+            if zustand_create "$FILE"; then
+              echo "ERROR: $FILE membuat Zustand store di Component. Zustand create hanya boleh di folder stores." | tee -a "$ERROR_FILE"
+            fi
+
+            if grep -nE "alert\(|confirm\(" "$FILE"; then
+              echo "WARNING: $FILE menggunakan alert/confirm. Pastikan bukan business logic berat." | tee -a "$WARNING_FILE"
+            fi
+          done
+
+          echo ""
+          echo "4. Checking Service SOP..."
+
+          if [ "${#SERVICE_FILES[@]}" -eq 0 ]; then
+            echo "WARNING: service files tidak ditemukan. API logic seharusnya berada di service." | tee -a "$WARNING_FILE"
+          fi
+
+          for FILE in "${SERVICE_FILES[@]}"; do
+            echo "Checking service: $FILE"
+
+            if grep -nE "return[[:space:]]*\([[:space:]]*<|<>|</[A-Za-z]" "$FILE"; then
+              echo "ERROR: $FILE mengandung JSX. Service tidak boleh berisi logic tampilan." | tee -a "$ERROR_FILE"
+            fi
+          done
+
+          echo ""
+          echo "5. Checking Custom Hook SOP..."
+
+          if [ "${#HOOK_FILES[@]}" -eq 0 ]; then
+            echo "WARNING: custom hook belum ditemukan. Logic UI sebaiknya berada di hook." | tee -a "$WARNING_FILE"
+          fi
+
+          echo ""
+          echo "6. Checking Zustand Store SOP..."
+
+          if [ -d src ]; then
+            STORE_VIOLATION=0
+            while IFS= read -r -d '' FILE; do
+              if MATCHES=$(zustand_create "$FILE"); then
+                echo "$MATCHES" | sed "s|^|$FILE:|" | tee -a "$ERROR_FILE"
+                STORE_VIOLATION=1
+              fi
+            done < <(find src -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
+              ! -path "src/stores/*" \
+              ! -path "src/features/*/stores/*" \
+              -print0)
+
+            if [ "$STORE_VIOLATION" -eq 1 ]; then
+              echo "ERROR: Zustand create ditemukan di luar src/stores atau src/features/**/stores." | tee -a "$ERROR_FILE"
+            fi
+          fi
+
+          echo ""
+          echo "7. Checking validation SOP..."
+
+          for FILE in "${PAGE_FILES[@]}" "${COMPONENT_FILES[@]}"; do
+            if grep -nE "required:|minLength|maxLength|pattern:|setError\(|errors\." "$FILE"; then
+              echo "WARNING: $FILE kemungkinan memiliki validasi manual. Validasi form wajib pakai schema Zod/Yup/Resolver." | tee -a "$WARNING_FILE"
+            fi
+          done
+
+          echo ""
+          echo "8. Checking API base URL policy..."
+
+          if [ -d src ]; then
+            HARDCODED_URLS=$(grep -R \
+              --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" \
+              -nE "http://|https://" src 2>/dev/null \
+              | grep -v "process.env" \
+              | grep -v "import.meta.env" \
+              | grep -v "\.env" \
+              | grep -v "localhost" \
+              | grep -v "www.w3.org" \
+              | grep -v "ui-avatars.com" \
+              | grep -v "basemaps.cartocdn.com" \
+              | grep -v "server.arcgisonline.com" \
+              || true)
+
+            if [ -n "$HARDCODED_URLS" ]; then
+              echo "$HARDCODED_URLS" | tee -a "$WARNING_FILE"
+              echo "WARNING: Ditemukan hardcoded URL. Endpoint API sebaiknya memakai env variable (NEXT_PUBLIC_*)." | tee -a "$WARNING_FILE"
+            fi
+          fi
+
+          # Ringkasan di tab Summary
+          {
+            echo "## Next.js SOP Check"
+            echo "- Errors: $(wc -l < "$ERROR_FILE" | tr -d ' ') baris"
+            echo "- Warnings: $(wc -l < "$WARNING_FILE" | tr -d ' ') baris"
+            if [ -s "$ERROR_FILE" ]; then
+              echo ""
+              echo "### Errors"
+              echo '```'
+              cat "$ERROR_FILE"
+              echo '```'
+            fi
+            if [ -s "$WARNING_FILE" ]; then
+              echo ""
+              echo "### Warnings"
+              echo '```'
+              cat "$WARNING_FILE"
+              echo '```'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          echo ""
+          echo "=== WARNINGS ==="
+
+          if [ -s "$WARNING_FILE" ]; then
+            cat "$WARNING_FILE"
+          else
+            echo "No warnings."
+          fi
+
+          echo ""
+          echo "=== ERRORS ==="
+
+          if [ -s "$ERROR_FILE" ]; then
+            cat "$ERROR_FILE"
+            echo ""
+            echo "Next.js SOP check failed."
+            exit 1
+          fi
+
+          echo "Next.js SOP check passed."
